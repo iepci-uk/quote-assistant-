@@ -1,0 +1,6 @@
+pandas # For data manipulation and analysis
+openpyxl # For reading and writing Excel files
+pdfplumber # For reading PDFs
+python-docx # For reading Word files
+streamlit # For the web app
+pytest # For testing
