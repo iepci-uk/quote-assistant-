@@ -18,6 +18,7 @@ How it works (same idea for all three formats)
 
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +41,9 @@ OUTPUT_COLUMNS = [
     "line_no", "description", "make", "part_code", "code_note",
     "qty", "unit", "source",
 ]
+
+# A PDF page with less text than this is a scan and is read with OCR.
+SCANNED_PAGE_CHARS = 20
 
 # Words people write instead of a part code when they have none.
 NO_CODE_WORDS = {"", "TBC", "TBA", "NA", "NIL", "NONE", "TOBECONFIRMED"}
@@ -125,15 +129,22 @@ def to_number(text: str):
 
 # ------------------------------------------------------------ table -> lines
 def lines_from_tables(tables):
-    """tables: list of (location_text, rows). Returns a DataFrame of lines."""
+    """tables: list of (location_text, rows) or (location_text, rows, row_sources).
+
+    row_sources (from OCR) gives each row its own source text. Returns a
+    DataFrame of lines.
+    """
     found = []
     last_mapping = None
     last_width = None
 
-    for location, rows in tables:
-        rows = [list(r) for r in rows if any(clean(c) for c in r)]
-        if not rows:
+    for location, rows, *row_sources in tables:
+        sources = row_sources[0] if row_sources else [location] * len(rows)
+        kept = [(list(r), s) for r, s in zip(rows, sources) if any(clean(c) for c in r)]
+        if not kept:
             continue
+        rows = [r for r, _ in kept]
+        sources = [s for _, s in kept]
 
         # Find the header row inside this table (could be below a title).
         mapping, start = None, 0
@@ -150,7 +161,7 @@ def lines_from_tables(tables):
             continue
         last_mapping, last_width = mapping, len(rows[0])
 
-        for row in rows[start:]:
+        for row, source in zip(rows[start:], sources[start:]):
             if map_header(row):          # repeated header row: skip
                 continue
             values = {field: clean(row[i]) for i, field in mapping.items() if i < len(row)}
@@ -175,7 +186,7 @@ def lines_from_tables(tables):
                     "code_note": note,
                     "qty": qty,
                     "unit": values.get("unit", ""),
-                    "source": location,
+                    "source": source,
                 }
             )
 
@@ -187,11 +198,38 @@ def tables_from_pdf(path: Path):
     import pdfplumber
 
     tables = []
+    scanned = scanned_pdf_pages(path)
     with pdfplumber.open(path) as pdf:
         for number, page in enumerate(pdf.pages, start=1):
+            if number in scanned:
+                tables += scanned[number].tables
+                continue
             for t, rows in enumerate(page.extract_tables(), start=1):
                 tables.append((f"page {number}, table {t}", rows))
     return tables
+
+
+def is_scanned_page(page) -> bool:
+    """A PDF page with (almost) no text is a scanned image."""
+    return len((page.extract_text() or "").strip()) < SCANNED_PAGE_CHARS
+
+
+def scanned_pdf_pages(path: Path) -> dict:
+    """OCR results for the pages that are images only (empty if none)."""
+    import pdfplumber
+
+    with pdfplumber.open(path) as pdf:
+        if not any(is_scanned_page(page) for page in pdf.pages):
+            return {}
+    from src.ocr_rfq import ocr_pdf_pages
+
+    return ocr_pdf_pages(path)
+
+
+def tables_from_image(path: Path):
+    from src.ocr_rfq import ocr_image
+
+    return [table for page in ocr_image(path) for table in page.tables]
 
 
 def tables_from_docx(path: Path):
@@ -216,30 +254,87 @@ def tables_from_excel(path: Path):
     return tables
 
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+TEXT_SUFFIXES = {".txt", ".eml", ".msg"}
+
 READERS = {
     ".pdf": tables_from_pdf,
     ".docx": tables_from_docx,
     ".xlsx": tables_from_excel,
     ".xlsm": tables_from_excel,
+    **{suffix: tables_from_image for suffix in IMAGE_SUFFIXES},
 }
 
+SUPPORTED = "PDF, DOCX, XLSX, an image (PNG, JPG, TIFF) or an email (EML, MSG, TXT)"
 
-def extract_rfq_lines(path) -> pd.DataFrame:
-    """Return the RFQ's line items as a table (one row per RFQ line)."""
+
+def code_index(catalogue=None):
+    """Catalogue part codes for checking OCR / email codes (None if no price lists)."""
+    from src.code_correction import CodeIndex
+
+    if catalogue is None:
+        return default_code_index()
+    return CodeIndex(catalogue)
+
+
+@lru_cache(maxsize=1)
+def default_code_index():
+    from src.code_correction import CodeIndex
+    from src.load_price_lists import DEFAULT_ABB, DEFAULT_SCHNEIDER, load_catalogue
+
+    if not (DEFAULT_ABB.exists() and DEFAULT_SCHNEIDER.exists()):
+        return None
+    return CodeIndex(load_catalogue())
+
+
+def extract_rfq_lines(path, catalogue=None) -> pd.DataFrame:
+    """Return the RFQ's line items as a table (one row per RFQ line).
+
+    catalogue (the price-list table) is used to check part codes read by OCR
+    or from email text. If it is not given, the price lists in data/raw are
+    loaded when needed.
+    """
     path = Path(path)
-    reader = READERS.get(path.suffix.lower())
+    suffix = path.suffix.lower()
+    if suffix in TEXT_SUFFIXES:
+        from src.text_rfq import lines_from_message
+
+        return lines_from_message(path, catalogue)
+
+    reader = READERS.get(suffix)
     if reader is None:
-        raise ValueError(
-            f"Unsupported file type '{path.suffix}'. Use PDF, DOCX or XLSX."
-        )
+        raise ValueError(f"Unsupported file type '{path.suffix}'. Use {SUPPORTED}.")
     lines = lines_from_tables(reader(path))
     if lines.empty:
+        if suffix in IMAGE_SUFFIXES or (suffix == ".pdf" and scanned_pdf_pages(path)):
+            raise ValueError(
+                f"No line-item table found in {path.name} after reading it with OCR. "
+                "Check the scan is clear and the items are in a table with a "
+                "header row (Description, Qty, ...)."
+            )
         raise ValueError(
-            f"No line-item table found in {path.name}. If this is a scanned "
-            "PDF it needs OCR first; if the items are in an email or plain "
-            "text, they need the AI extraction step (not built yet)."
+            f"No line-item table found in {path.name}. The items must be in a "
+            "table with a header row (Description, Qty, ...). For items written "
+            "as text, paste the text or upload it as an email / .txt file."
         )
+
+    scanned = lines["source"].str.contains("(OCR", regex=False)
+    if scanned.any():
+        from src.code_correction import correct_codes
+        from src.ocr_rfq import check_line_numbers
+
+        lines = check_line_numbers(lines)
+        index = code_index(catalogue)
+        if index is not None:
+            lines.loc[scanned] = correct_codes(lines[scanned], index)
     return lines
+
+
+def extract_rfq_from_text(text: str, catalogue=None):
+    """Line items and header details from pasted email / plain text."""
+    from src.text_rfq import header_from_text, lines_from_text
+
+    return lines_from_text(text, catalogue), header_from_text(text)
 
 
 # ------------------------------------------------------------ RFQ header
@@ -294,10 +389,20 @@ def text_lines_from_pdf(path: Path):
     import pdfplumber
 
     lines = []
+    scanned = scanned_pdf_pages(path)
     with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            lines += (page.extract_text() or "").splitlines()
+        for number, page in enumerate(pdf.pages, start=1):
+            if number in scanned:
+                lines += scanned[number].text_lines
+            else:
+                lines += (page.extract_text() or "").splitlines()
     return lines
+
+
+def text_lines_from_image(path: Path):
+    from src.ocr_rfq import ocr_image
+
+    return [line for page in ocr_image(path) for line in page.text_lines]
 
 
 def text_lines_from_docx(path: Path):
@@ -329,6 +434,7 @@ TEXT_READERS = {
     ".docx": text_lines_from_docx,
     ".xlsx": text_lines_from_excel,
     ".xlsm": text_lines_from_excel,
+    **{suffix: text_lines_from_image for suffix in IMAGE_SUFFIXES},
 }
 
 
@@ -386,15 +492,19 @@ def extract_rfq_header(path) -> dict:
     """Return the RFQ's header details as a dict (empty string if not found)."""
     path = Path(path)
     suffix = path.suffix.lower()
+    if suffix in TEXT_SUFFIXES:
+        from src.text_rfq import header_from_message
+
+        return header_from_message(path)
     if suffix not in READERS or suffix not in TEXT_READERS:
-        raise ValueError(f"Unsupported file type '{path.suffix}'. Use PDF, DOCX or XLSX.")
+        raise ValueError(f"Unsupported file type '{path.suffix}'. Use {SUPPORTED}.")
 
     header = {key: "" for key, _ in HEADER_FIELDS}
     lines = TEXT_READERS[suffix](path)
     header.update(parse_letterhead(lines))
 
     # 'Label | value' rows anywhere in the file (RFQ No., Date, Project...).
-    for _, rows in READERS[suffix](path):
+    for _, rows, *_ in READERS[suffix](path):
         for row in rows:
             cells = [clean(c) for c in row if clean(c)]
             if len(cells) < 2:

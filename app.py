@@ -7,7 +7,7 @@ import base64
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from src.extract_rfq import HEADER_FIELDS, extract_rfq_header, extract_rfq_lines
+from src.extract_rfq import HEADER_FIELDS, extract_rfq_from_text, extract_rfq_header, extract_rfq_lines
 from src.match_missing_codes import find_missing_code_candidates
 from src.load_price_lists import load_catalogue
 from src.generate_quotation import generate_quotation
@@ -607,34 +607,61 @@ def prepare_rfq(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def store_rfq(extracted: pd.DataFrame, header: dict, filename: str) -> None:
+    """Put extracted RFQ lines and header into session state."""
+    st.session_state["rfq_lines"] = prepare_rfq(extracted)
+    st.session_state["rfq_filename"] = filename
+    st.session_state["match_candidates"] = None
+    st.session_state["rfq_read_by_ocr"] = bool(
+        extracted["source"].astype(str).str.contains("(OCR", regex=False).any()
+    )
+    st.session_state["rfq_header"] = header
+    for key, _ in HEADER_FIELDS:
+        st.session_state.pop(f"hdr_{key}", None)
+    st.session_state.pop("rfq_editor", None)
+    st.session_state.pop("pricing_editor", None)
+    st.session_state.pop("quotation_bytes", None)
+
+
 def load_rfq_bytes(file_bytes: bytes, filename: str) -> bool:
     """Extract RFQ lines and header from file bytes into session state."""
     with TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir) / filename
         temp_path.write_bytes(file_bytes)
 
-        extracted = extract_rfq_lines(str(temp_path))
+        extracted = extract_rfq_lines(str(temp_path), get_catalogue())
         extracted = pd.DataFrame(extracted)
 
         if extracted.empty:
             return False
-
-        st.session_state["rfq_lines"] = prepare_rfq(extracted)
-        st.session_state["rfq_filename"] = filename
-        st.session_state["match_candidates"] = None
 
         try:
             header = extract_rfq_header(str(temp_path))
         except Exception:
             header = {key: "" for key, _ in HEADER_FIELDS}
 
-        st.session_state["rfq_header"] = header
-        for key, _ in HEADER_FIELDS:
-            st.session_state.pop(f"hdr_{key}", None)
-        st.session_state.pop("rfq_editor", None)
-        st.session_state.pop("pricing_editor", None)
-        st.session_state.pop("quotation_bytes", None)
+        store_rfq(extracted, header, filename)
         return True
+
+
+def load_rfq_text(text: str) -> bool:
+    """Extract RFQ lines and header from pasted email text into session state."""
+    extracted, header = extract_rfq_from_text(text, get_catalogue())
+    if extracted.empty:
+        return False
+    store_rfq(extracted, header, "Pasted email text")
+    return True
+
+
+def lines_to_check(rfq: pd.DataFrame) -> pd.DataFrame:
+    """RFQ lines a person should look at first: unsure OCR, corrected or unclear values."""
+    source = rfq["source"].fillna("").astype(str) if "source" in rfq.columns else pd.Series("", index=rfq.index)
+    note = rfq["code_note"].fillna("").astype(str) if "code_note" in rfq.columns else pd.Series("", index=rfq.index)
+    flagged = (
+        source.str.contains("check")
+        | note.str.contains("corrected|check|unclear|closest is", regex=True)
+    )
+    return rfq[flagged]
 
 
 # Initialize session state keys
@@ -1062,21 +1089,21 @@ elif current_page == "RFQ Analysis":
         """
         <div class="ui-card">
             <div class="ui-card-title">📤 Select RFQ Document</div>
-            <div class="ui-card-subtitle">Supported formats: PDF (.pdf), Excel (.xlsx, .xls), Word (.docx)</div>
+            <div class="ui-card-subtitle">Supported formats: PDF (.pdf, including scans), Excel (.xlsx, .xls), Word (.docx), images (.png, .jpg, .tif), emails (.eml, .msg, .txt)</div>
         """,
         unsafe_allow_html=True,
     )
 
     uploaded_file = st.file_uploader(
         "Upload customer RFQ file",
-        type=["pdf", "xlsx", "xls", "docx"],
+        type=["pdf", "xlsx", "xls", "docx", "png", "jpg", "jpeg", "tif", "tiff", "eml", "msg", "txt"],
         label_visibility="collapsed",
     )
 
     col_up1, col_up2 = st.columns([1, 1])
     with col_up1:
         if uploaded_file and st.button("🚀 Extract RFQ Items from Upload", type="primary", use_container_width=True):
-            with st.spinner("Extracting line items and document headers..."):
+            with st.spinner("Extracting line items and document headers (scanned pages are read with OCR and can take a minute)..."):
                 try:
                     success = load_rfq_bytes(uploaded_file.getvalue(), uploaded_file.name)
                     if success:
@@ -1098,6 +1125,38 @@ elif current_page == "RFQ Analysis":
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # Paste Email Text Card
+    st.markdown(
+        """
+        <div class="ui-card">
+            <div class="ui-card-title">✉️ Or Paste Email Text</div>
+            <div class="ui-card-subtitle">Paste an RFQ email: one item per line with its quantity, labelled items (Description / Part No / Qty), or a table copied from Excel.</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    pasted_text = st.text_area(
+        "RFQ email text",
+        height=200,
+        placeholder="1. ABB MCB 3 pole 32A, 1SYS273022R0324 - 24 nos\n2. Schneider MCCB 100A 4P LV510347 x 4",
+        label_visibility="collapsed",
+    )
+
+    col_txt, _ = st.columns([1, 1])
+    with col_txt:
+        if pasted_text.strip() and st.button("🚀 Extract RFQ Items from Text", type="primary", use_container_width=True):
+            with st.spinner("Reading items from the email text..."):
+                try:
+                    if load_rfq_text(pasted_text):
+                        st.success(f"Successfully extracted {len(st.session_state['rfq_lines'])} items from the text!")
+                        st.rerun()
+                    else:
+                        st.warning("No line items were found in the text.")
+                except Exception as error:
+                    st.error(f"Extraction failed: {error}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
     rfq = get_rfq()
 
     if rfq is not None:
@@ -1113,6 +1172,24 @@ elif current_page == "RFQ Analysis":
             """,
             unsafe_allow_html=True,
         )
+
+        to_check = lines_to_check(rfq)
+        if not to_check.empty:
+            listed = ", ".join(str(n) for n in to_check["line_no"])
+            st.markdown(
+                f"""
+                <div class="callout-amber">
+                    <span style="font-size: 1.3rem;">⚠️</span>
+                    <div>
+                        <strong>Check these lines first: {listed}</strong><br>
+                        They were read from a scan with low confidence, had a part code or line number
+                        corrected against the price lists, or have an unclear quantity. See the
+                        <em>code_note</em> and <em>source</em> columns.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         edited = st.data_editor(
             rfq,
@@ -1143,6 +1220,20 @@ elif current_page == "RFQ Analysis":
             """,
             unsafe_allow_html=True,
         )
+
+        if st.session_state.get("rfq_read_by_ocr"):
+            st.markdown(
+                """
+                <div class="callout-amber">
+                    <span style="font-size: 1.3rem;">⚠️</span>
+                    <div>
+                        <strong>Read from a scan:</strong> check names, phone numbers and email
+                        addresses below against the document before issuing the quotation.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         header = st.session_state.get("rfq_header", {})
         left, right = st.columns(2)

@@ -4,3 +4,7 @@ pdfplumber # For reading PDFs
 python-docx # For reading Word files
 streamlit # For the web app
 pytest # For testing
+pytesseract # For reading scanned RFQs (needs Tesseract OCR installed)
+opencv-python # For cleaning up scans and finding table lines
+extract-msg # For reading Outlook .msg emails
+beautifulsoup4 # For reading HTML emails

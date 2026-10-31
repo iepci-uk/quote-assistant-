@@ -1,6 +1,6 @@
 # IEPCI Quote Assistant
 
-Reads a customer RFQ (PDF, Word or Excel), finds each item in the ABB and
+Reads a customer RFQ (PDF, Word, Excel, a scan or photo, or an email), finds each item in the ABB and
 Schneider price lists, and produces a DRAFT Excel quotation from the IEPCI
 template. All amounts are in INR. A person reviews everything: a rate only
 appears in the quotation when it is ticked "Rate approved". The supplier list
@@ -14,6 +14,12 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows PowerShell
 pip install -r requirements.txt
 ```
+
+For scanned RFQs, install Tesseract OCR for Windows
+(https://github.com/UB-Mannheim/tesseract/wiki) with the default options. It
+is found in `C:\Program Files\Tesseract-OCR`, on the PATH, or wherever the
+`TESSERACT_CMD` environment variable points. Everything runs on this computer;
+nothing is sent online.
 
 Put these files in `data/raw/` with exactly these names:
 
@@ -35,7 +41,9 @@ python -m src.generate_quotation data/raw/RFQ_KBS-0147.pdf --list-prices --out q
                                                       # Excel quotation using supplier list prices (INR)
 python -m src.generate_quotation data/raw/RFQ_KBS-0147.pdf   # same, but rates left blank
 python src/load_price_lists.py                        # rebuild data/processed/price_catalogue.csv
-python src/extract_rfq.py data/raw/RFQ_KBS-0147.pdf   # show extracted lines + details
+python -m src.extract_rfq data/raw/RFQ_KBS-0147.pdf   # show extracted lines + details (any file type)
+python -m src.ocr_rfq scan.pdf --compare data/raw/RFQ_KBS-0147.pdf
+                                                      # OCR accuracy against a known RFQ
 ```
 
 Always run from the project root.
@@ -44,6 +52,9 @@ Always run from the project root.
 
 ```
 RFQ file --extract_rfq.py--> line items + RFQ details (customer, RFQ no., ...)
+  scans / photos --ocr_rfq.py---^  |
+  emails / text --text_rfq.py---^  |
+  OCR / typed codes --code_correction.py (checked against the price lists)
                                    |
 price lists --load_price_lists.py--+--> one catalogue table (6,366 rows)
                                    |
@@ -60,12 +71,32 @@ price lists --load_price_lists.py--+--> one catalogue table (6,366 rows)
 |---|---|
 | `app.py` | Streamlit app: upload, review, matching, catalogue, pricing, download |
 | `src/extract_rfq.py` | Tables out of PDF/Word/Excel; header details; code-vs-note split |
+| `src/ocr_rfq.py` | Scanned pages and photos: straighten, find table cells, read each cell with Tesseract |
+| `src/text_rfq.py` | Email / text RFQs (.eml, .msg, .txt, pasted): attachments, pasted tables, item lines |
+| `src/code_correction.py` | Fixes OCR misreads in part codes against the price lists; never changes typed codes |
 | `src/load_price_lists.py` | ABB and Schneider layouts into one common table |
 | `src/check_rfq_codes.py` | Part-code lookup with review flags |
 | `src/match_missing_codes.py` | Spec-based candidates for lines without a code (air circuit breakers only) |
 | `src/pricing.py` | Supplier list prices (INR, no discount); fills rates only where the price is clear |
 | `src/generate_quotation.py` | Fills the template; adds rows beyond 17 lines; wraps long descriptions |
 | `tests/test_kestrel_rfq.py` | Golden test for the Kestrel RFQ (30 checks) |
+| `tests/test_ocr_and_text.py` | Scans made from the Kestrel RFQ must read the same; email and text formats |
+
+### Scans and emails
+
+A PDF page with no text is read with OCR. Every table cell is read on its own;
+quantities and line numbers are read three times and only accepted when the
+readings agree. Part codes are checked against the price lists: a code with
+look-alike characters (O/0, I/1, S/5, `$`/S) or one wrong character is
+corrected only when exactly one price-list code fits, and the note says what
+was read. Anything uncertain gets `(OCR, check)` in the source column or a
+note, and the app lists those lines first.
+
+Email RFQs: an attached RFQ file is read first. Otherwise the text is read as
+a pasted table, as labelled blocks (`Description:` / `Part No:` / `Qty:`), or
+one item per line. A line with two different quantities gets none and the
+note `check qty`. Codes the customer typed are never changed; if one is not in
+the price lists, the closest one is mentioned in the note.
 
 ### What "clear price" means
 
@@ -77,8 +108,14 @@ person prices them.
 
 ## Known limits
 
-- RFQs must contain a table. Scanned PDFs (need OCR) and RFQs written as
-  email text (need AI extraction) are not supported yet.
+- Scans must be readable by eye: OCR has been tested on clean and poor
+  (200 dpi, tilted, grainy) scans, photos and sideways pages of printed
+  RFQs. Handwriting is not supported. Header details from a scan (names,
+  phone numbers) are less reliable than the line items: check them.
+- A scanned table without ruling lines is read from the word positions; this
+  is less reliable than a ruled table.
+- Email text is read with rules, not AI: items written as free sentences
+  ("we also need a couple of contactors") are not picked up.
 - "MATCHED - VERIFY SPECS" means the part code exists. It does not yet compare
   the catalogue specs with the RFQ description.
 - `breaking_capacity` is a class letter for ABB (for example N) and kA for
