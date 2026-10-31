@@ -20,6 +20,10 @@ import pandas as pd
 RAW_DIR = Path("data/raw")
 DEFAULT_ABB = RAW_DIR / "ABB_Price_List_Feb2026.xlsx"
 DEFAULT_SCHNEIDER = RAW_DIR / "Schneider LV Price list Apr 2026.xlsx"
+DEFAULT_LUCY = RAW_DIR / "Lucy_Electric_Aegis_Plus_Price_List.xlsx"
+DEFAULT_SCHNEIDER_AUTO = RAW_DIR / "Schneider_Automation_Price_List_Apr2026.xlsx"
+DEFAULT_SIEMENS_CP = RAW_DIR / "Siemens_LV_Control_Products_Price_List_Jul2026.xlsx"
+DEFAULT_SIEMENS_PD = RAW_DIR / "Siemens_LV_Power_Distribution_Price_List_Jul2026.xlsx"
 DEFAULT_OUT = Path("data/processed/price_catalogue.csv")
 
 # Every sheet has: row 1 title, row 2 source note, row 3 blank, row 4 headers.
@@ -27,6 +31,10 @@ DEFAULT_OUT = Path("data/processed/price_catalogue.csv")
 HEADER_ROW = 3
 
 ABB_SHEET = "ABB Price List"
+LUCY_SHEET = "Lucy Electric Price List"
+SCHNEIDER_AUTO_SHEET = "Schneider Automation Price List"
+SIEMENS_CP_SHEET = "Siemens CP Price List"
+SIEMENS_PD_SHEET = "Siemens PD Price List"
 
 # Schneider sheets that are NOT product tables (no part codes / prices).
 SCHNEIDER_SKIP = {"Read Me & Search Guide", "Category Technical Data"}
@@ -107,7 +115,7 @@ def parse_abb_ratings(row: pd.Series):
         if "pole" in h and not poles:
             poles = first_number(value)
         elif (
-            re.search(r"\bin\s*\(a\)|^in$|current rating|rated current", h)
+            re.search(r"\bin\s*\(a\)|^in$|current rating|rated current|^current\b|thermal current", h)
             and not rating_a
         ):
             rating_a = first_number(value)
@@ -124,32 +132,53 @@ def parse_abb_ratings(row: pd.Series):
     return rating_a, poles, breaking, "; ".join(leftovers)
 
 
-def load_abb(path: Path) -> pd.DataFrame:
-    raw = read_sheet(path, ABB_SHEET)
+def load_uniform_sheet(path: Path, sheet: str, supplier_name: str) -> pd.DataFrame:
+    """Load a sheet formatted with the 22-column uniform layout (ABB schema)."""
+    raw = read_sheet(path, sheet)
     parsed = raw.apply(parse_abb_ratings, axis=1, result_type="expand")
     parsed.columns = ["rating_a", "poles", "breaking_capacity", "specs"]
     price, status = clean_prices(raw["Price"])
 
     out = pd.DataFrame(
         {
-            "supplier": "ABB",
-            "source_sheet": ABB_SHEET,
+            "supplier": supplier_name,
+            "source_sheet": sheet,
             "category": raw["Category"],
             "part_code": raw["Part code"],
             "part_code_key": raw["Part code"].map(make_key),
-            "description": (raw["Description"] + " | " + raw["Key word"]).str.strip(" |"),
+            "description": (raw["Description"] + " | " + raw.get("Key word", "")).str.strip(" |"),
             "rating_a": parsed["rating_a"],
             "poles": parsed["poles"],
             "breaking_capacity": parsed["breaking_capacity"],
             "specs": parsed["specs"],
             "price_inr": price,
             "price_status": status,
-            "stocked": raw["Stocked or Not stocked"],
-            "page": raw["Price List Page"],
+            "stocked": raw.get("Stocked or Not stocked", ""),
+            "page": raw.get("Price List Page", ""),
         }
     )
     # Drop completely empty spacer rows (no description and no code).
     return out[(out["part_code"] != "") | (out["description"] != "")]
+
+
+def load_abb(path: Path) -> pd.DataFrame:
+    return load_uniform_sheet(path, ABB_SHEET, "ABB")
+
+
+def load_lucy(path: Path) -> pd.DataFrame:
+    return load_uniform_sheet(path, LUCY_SHEET, "Lucy Electric")
+
+
+def load_schneider_auto(path: Path) -> pd.DataFrame:
+    return load_uniform_sheet(path, SCHNEIDER_AUTO_SHEET, "Schneider Electric")
+
+
+def load_siemens_cp(path: Path) -> pd.DataFrame:
+    return load_uniform_sheet(path, SIEMENS_CP_SHEET, "Siemens")
+
+
+def load_siemens_pd(path: Path) -> pd.DataFrame:
+    return load_uniform_sheet(path, SIEMENS_PD_SHEET, "Siemens")
 
 
 # ---------------------------------------------------------------- Schneider
@@ -217,11 +246,32 @@ def load_schneider(path: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- main
-def load_catalogue(abb_path=DEFAULT_ABB, schneider_path=DEFAULT_SCHNEIDER) -> pd.DataFrame:
-    """Return one table with every ABB and Schneider product row."""
-    abb = load_abb(Path(abb_path))
-    schneider = load_schneider(Path(schneider_path))
-    return pd.concat([abb, schneider], ignore_index=True)[COLUMNS]
+def load_catalogue(
+    abb_path=DEFAULT_ABB,
+    schneider_path=DEFAULT_SCHNEIDER,
+    lucy_path=DEFAULT_LUCY,
+    schneider_auto_path=DEFAULT_SCHNEIDER_AUTO,
+    siemens_cp_path=DEFAULT_SIEMENS_CP,
+    siemens_pd_path=DEFAULT_SIEMENS_PD,
+) -> pd.DataFrame:
+    """Return one table with every product row from all available supplier price lists."""
+    parts = []
+    if abb_path and Path(abb_path).exists():
+        parts.append(load_abb(Path(abb_path)))
+    if schneider_path and Path(schneider_path).exists():
+        parts.append(load_schneider(Path(schneider_path)))
+    if lucy_path and Path(lucy_path).exists():
+        parts.append(load_lucy(Path(lucy_path)))
+    if schneider_auto_path and Path(schneider_auto_path).exists():
+        parts.append(load_schneider_auto(Path(schneider_auto_path)))
+    if siemens_cp_path and Path(siemens_cp_path).exists():
+        parts.append(load_siemens_cp(Path(siemens_cp_path)))
+    if siemens_pd_path and Path(siemens_pd_path).exists():
+        parts.append(load_siemens_pd(Path(siemens_pd_path)))
+
+    if not parts:
+        return pd.DataFrame(columns=COLUMNS)
+    return pd.concat(parts, ignore_index=True)[COLUMNS]
 
 
 def print_report(df: pd.DataFrame) -> None:
@@ -246,10 +296,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--abb", default=DEFAULT_ABB, type=Path)
     parser.add_argument("--schneider", default=DEFAULT_SCHNEIDER, type=Path)
+    parser.add_argument("--lucy", default=DEFAULT_LUCY, type=Path)
+    parser.add_argument("--schneider-auto", default=DEFAULT_SCHNEIDER_AUTO, type=Path)
+    parser.add_argument("--siemens-cp", default=DEFAULT_SIEMENS_CP, type=Path)
+    parser.add_argument("--siemens-pd", default=DEFAULT_SIEMENS_PD, type=Path)
     parser.add_argument("--out", default=DEFAULT_OUT, type=Path)
     args = parser.parse_args()
 
-    catalogue = load_catalogue(args.abb, args.schneider)
+    catalogue = load_catalogue(
+        args.abb,
+        args.schneider,
+        args.lucy,
+        args.schneider_auto,
+        args.siemens_cp,
+        args.siemens_pd,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     catalogue.to_csv(args.out, index=False)
     print_report(catalogue)
