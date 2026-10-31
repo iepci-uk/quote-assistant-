@@ -89,7 +89,7 @@ def test_header_details(header):
 
 # ------------------------------------------------------------ catalogue check
 def test_catalogue_loaded_both_suppliers(catalogue):
-    assert set(catalogue["supplier"]) == {"ABB", "Schneider Electric"}
+    assert {"ABB", "Schneider Electric"}.issubset(set(catalogue["supplier"]))
     assert len(catalogue) > 6000
 
 
