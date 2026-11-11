@@ -9,24 +9,19 @@ def import_catalogue(replace: bool = False):
     init_db()
     csv_file = Path("data/processed/price_catalogue.csv")
     if not csv_file.exists():
-        print(f"Error: {csv_file} not found. Please generate it first.")
         return
 
     session = SessionLocal()
     count = session.query(CatalogueItem).count()
     if count > 0 and not replace:
-        print(f"Catalogue already has {count} items in the database.")
-        print("To overwrite and re-import, run with: python -m src.import_catalogue --replace")
         session.close()
         return
 
     if count > 0 and replace:
         session.query(CatalogueItem).delete()
         session.commit()
-        print(f"Cleared {count} existing records.")
     session.close()
 
-    print(f"Reading {csv_file}...")
     df = pd.read_csv(csv_file)
 
     # Clean text columns
@@ -34,14 +29,7 @@ def import_catalogue(replace: bool = False):
     df["supplier"] = df["supplier"].fillna("Unknown").astype(str)
     df["part_code"] = df["part_code"].fillna("").astype(str)
 
-    print(f"Importing {len(df)} items into database...")
     df.to_sql("catalogue_items", con=engine, if_exists="append", index=False, chunksize=1000)
-
-    # Verify total
-    session = SessionLocal()
-    total = session.query(CatalogueItem).count()
-    session.close()
-    print(f"Done! Total catalogue items in database: {total}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import CSV catalogue into SQLite database.")

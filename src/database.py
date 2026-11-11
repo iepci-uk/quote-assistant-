@@ -277,17 +277,11 @@ def delete_rfq_record(rfq_id: int) -> bool:
 
 if __name__ == "__main__":
     init_db()
-    print("Database functions ready. Running self-test...")
     sample_header = {"customer_name": "Test Customer Ltd", "rfq_number": "TEST-001"}
     sample_lines = pd.DataFrame([
         {"line_no": 1, "description": "MCCB 100A 3P", "qty": 2, "unit": "Nos", "unit_rate": 5000.0, "price_approved": True}
     ])
     saved_id = save_rfq_record(sample_header, sample_lines, filename="test.pdf")
-    print(f"Self-test: Successfully saved sample RFQ with ID: {saved_id}")
-    
     rfqs = list_saved_rfqs()
-    print(f"Self-test: Found {len(rfqs)} saved RFQs in database.")
-    
     # Clean up test record
     delete_rfq_record(saved_id)
-    print("Self-test: Cleaned up test record. All systems operational!")

@@ -275,21 +275,7 @@ def load_catalogue(
 
 
 def print_report(df: pd.DataFrame) -> None:
-    print(f"Total rows: {len(df)}")
-    print("\nRows per supplier / sheet:")
-    print(df.groupby(["supplier", "source_sheet"]).size().to_string())
-
-    print("\nPrice status:")
-    print(df["price_status"].value_counts().to_string())
-
-    no_code = df[df["part_code_key"] == ""]
-    print(f"\nRows with NO part code: {len(no_code)}")
-
-    coded = df[df["part_code_key"] != ""]
-    dup = coded[coded["part_code_key"].duplicated(keep=False)]
-    print(f"Rows sharing a part code with another row: {len(dup)}")
-    if len(dup):
-        print(dup.sort_values("part_code_key")[["supplier", "source_sheet", "part_code", "price_inr"]].head(10).to_string(index=False))
+    pass
 
 
 if __name__ == "__main__":
@@ -313,5 +299,3 @@ if __name__ == "__main__":
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     catalogue.to_csv(args.out, index=False)
-    print_report(catalogue)
-    print(f"\nSaved to {args.out}")

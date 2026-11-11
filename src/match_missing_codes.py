@@ -306,13 +306,6 @@ def main():
 
     candidates = find_missing_code_candidates(rfq_lines)
 
-    if not candidates:
-        print("No candidates found for missing-code RFQ lines.")
-        return
-
-    for candidate in candidates:
-        print(candidate)
-
 
 if __name__ == "__main__":
     main()
