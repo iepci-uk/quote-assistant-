@@ -422,10 +422,4 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit("Usage: python src/extract_rfq.py <rfq file>")
     result = extract_rfq_lines(sys.argv[1])
-    pd.set_option("display.width", 200, "display.max_colwidth", 38)
-    print(result.drop(columns=["source"]).to_string(index=False))
-    print(f"\n{len(result)} lines extracted.")
-    header = extract_rfq_header(sys.argv[1])
-    print("\nRFQ header:")
-    for key, label in HEADER_FIELDS:
-        print(f"  {label}: {header[key] or '-'}")
+    header = extract_rfq_header(sys.argv[1])
