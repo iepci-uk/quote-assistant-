@@ -1,4 +1,4 @@
-"""Read an RFQ file (PDF, Word or Excel) and return its line items.
+"""Read an RFQ file (PDF, Word, Excel or email) and return its line items.
 
     from extract_rfq import extract_rfq_lines
     lines = extract_rfq_lines("data/raw/RFQ_KBS-0147.pdf")
@@ -112,6 +112,10 @@ def normalise_make(text: str) -> str:
         return "ABB"
     if "schneider" in low:
         return "Schneider Electric"
+    if "siemens" in low:
+        return "Siemens"
+    if re.search(r"\blucy\b", low):
+        return "Lucy Electric"
     return clean(text)
 
 
@@ -183,15 +187,92 @@ def lines_from_tables(tables):
 
 
 # ------------------------------------------------------------ readers
+def _has_header(rows) -> bool:
+    return any(map_header(row) for row in list(rows)[:30])
+
+
+def _words_as_boxes(page):
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+    return [
+        {"text": w["text"], "x0": w["x0"], "y0": w["top"], "x1": w["x1"], "y1": w["bottom"], "score": 1.0}
+        for w in words
+    ]
+
+
+def _tidy_description_column(rows):
+    from src.layout import tidy_ocr_text
+
+    mapping = map_header(rows[0]) or {}
+    for i, field in mapping.items():
+        if field == "description":
+            for row in rows[1:]:
+                if i < len(row):
+                    row[i] = tidy_ocr_text(row[i])
+    return rows
+
+
 def tables_from_pdf(path: Path):
+    """Tables on every page. Three kinds of page are handled:
+    * normal pages with ruled tables  -> pdfplumber's table finder,
+    * tables without lines            -> rebuilt from word positions,
+    * scanned pages (just an image)   -> OCR, then rebuilt from positions.
+    """
     import pdfplumber
+    from src import layout, ocr
 
     tables = []
+    carry = {"ocr": (None, None), "words": (None, None)}  # header for continued tables
     with pdfplumber.open(path) as pdf:
         for number, page in enumerate(pdf.pages, start=1):
-            for t, rows in enumerate(page.extract_tables(), start=1):
+            if ocr.page_needs_ocr(page):
+                boxes = ocr.ocr_pdf_page(path, number - 1)
+
+                def reread(x0, y0, x1, y1, _page=number - 1):
+                    return ocr.reread_region(path, _page, x0, y0, x1, y1)
+
+                rows, cells, mapping, flagged = layout.table_from_boxes(
+                    boxes, *carry["ocr"], reread=reread
+                )
+                carry["ocr"] = (cells, mapping)
+                if rows:
+                    location = f"page {number} (OCR)"
+                    if flagged:
+                        location += f" - check line {', '.join(flagged)}"
+                    tables.append((location, _tidy_description_column(rows)))
+                continue
+
+            found = page.extract_tables()
+            for t, rows in enumerate(found, start=1):
                 tables.append((f"page {number}, table {t}", rows))
+            if not any(_has_header(rows) for rows in found):
+                boxes = layout.merge_words(_words_as_boxes(page))
+                rows, cells, mapping, _ = layout.table_from_boxes(boxes, *carry["words"])
+                carry["words"] = (cells, mapping)
+                if rows:
+                    tables.append((f"page {number}, text layout", rows))
     return tables
+
+
+def label_rows_from_pdf(path: Path):
+    """Rows used to find 'label | value' header details. Scanned pages add
+    every OCR text row split into cells."""
+    import pdfplumber
+    from src import layout, ocr
+
+    rows = [r for _, table in tables_from_pdf(path) for r in table]
+    with pdfplumber.open(path) as pdf:
+        for number, page in enumerate(pdf.pages, start=1):
+            if ocr.page_needs_ocr(page):
+                rows += layout.cell_rows(ocr.ocr_pdf_page(path, number - 1))
+    return rows
+
+
+def pdf_has_scanned_pages(path) -> bool:
+    import pdfplumber
+    from src import ocr
+
+    with pdfplumber.open(path) as pdf:
+        return any(ocr.page_needs_ocr(page) for page in pdf.pages)
 
 
 def tables_from_docx(path: Path):
@@ -224,22 +305,108 @@ READERS = {
 }
 
 
-def extract_rfq_lines(path) -> pd.DataFrame:
-    """Return the RFQ's line items as a table (one row per RFQ line)."""
-    path = Path(path)
-    reader = READERS.get(path.suffix.lower())
-    if reader is None:
-        raise ValueError(
-            f"Unsupported file type '{path.suffix}'. Use PDF, DOCX or XLSX."
-        )
-    lines = lines_from_tables(reader(path))
-    if lines.empty:
-        raise ValueError(
-            f"No line-item table found in {path.name}. If this is a scanned "
-            "PDF it needs OCR first; if the items are in an email or plain "
-            "text, they need the AI extraction step (not built yet)."
-        )
+EMAIL_SUFFIXES = {".eml", ".msg", ".txt"}
+SUPPORTED_TEXT = "PDF, DOCX, XLSX, EML, MSG or TXT"
+
+
+class NoLineItemsError(ValueError):
+    """The file was read but no RFQ line items were found in it."""
+
+
+def _whole_numbers(lines: pd.DataFrame) -> pd.DataFrame:
+    """Keep quantities as 24, not 24.0, even when one line has no quantity
+    (pandas turns a number column with a gap into decimals)."""
+    lines = lines.reset_index(drop=True)
+
+    def tidy(value):
+        if value is None or pd.isna(value):
+            return None
+        return int(value) if float(value).is_integer() else float(value)
+
+    lines["qty"] = pd.Series([tidy(v) for v in lines["qty"]], dtype=object)
     return lines
+
+
+def _lines_from_document(path: Path) -> pd.DataFrame:
+    """Tables first; if there are none, read the items from the free text."""
+    from src.parse_free_text import lines_from_text
+
+    lines = lines_from_tables(READERS[path.suffix.lower()](path))
+    if lines.empty:
+        text = TEXT_READERS[path.suffix.lower()](path)
+        lines = lines_from_text(text, "text")
+    return lines
+
+
+def _lines_from_email(path: Path) -> pd.DataFrame:
+    from tempfile import TemporaryDirectory
+
+    from src.parse_free_text import lines_from_text
+    from src.read_email import read_email
+
+    mail = read_email(path)
+    parts = []
+    with TemporaryDirectory() as folder:
+        for filename, data in mail["attachments"]:
+            suffix = Path(filename).suffix.lower()
+            if suffix not in READERS or not data:
+                continue
+            attached = Path(folder) / filename
+            attached.write_bytes(data)
+            try:
+                found = _lines_from_document(attached)
+            except Exception:           # a broken attachment must not stop the email
+                continue
+            found["source"] = f"attachment {filename}, " + found["source"]
+            parts.append(found)
+
+    # Items in the email text itself. If an attachment holds a proper table
+    # and the body only says 'please quote', the body adds nothing.
+    body = lines_from_text(mail["body"], "email body")
+    if not body.empty:
+        parts.insert(0, body)
+    if not parts:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    return pd.concat(parts, ignore_index=True)[OUTPUT_COLUMNS]
+
+
+def extract_rfq_lines(path) -> pd.DataFrame:
+    """Return the RFQ's line items as a table (one row per RFQ line).
+
+    Order of attempts: tables (PDF/Word/Excel) -> OCR for scanned PDF pages
+    -> table layout rebuilt from text positions -> free text (emails, plain
+    text, prose RFQs). The 'source' column says which one found each line.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in EMAIL_SUFFIXES:
+        lines = _lines_from_email(path)
+    elif suffix in READERS:
+        lines = _lines_from_document(path)
+    else:
+        raise ValueError(f"Unsupported file type '{path.suffix}'. Use {SUPPORTED_TEXT}.")
+    if lines.empty:
+        raise NoLineItemsError(
+            f"No line items found in {path.name}. There was no item table, and "
+            "the text has no lines with a quantity (e.g. '10 nos') or a "
+            "numbered item list."
+        )
+    return _whole_numbers(lines)
+
+
+def extract_rfq_from_text(text: str):
+    """Line items and header from pasted text (e.g. an email body).
+    Returns (lines DataFrame, header dict)."""
+    from src.parse_free_text import lines_from_text
+    from src.read_email import header_from_text
+
+    lines = lines_from_text(text or "", "pasted text")
+    if lines.empty:
+        raise NoLineItemsError(
+            "No line items found in the pasted text. Put one item per line with "
+            "its quantity (e.g. 'ABB MCB 32A 4P - 10 nos'), or paste the item table."
+        )
+    return _whole_numbers(lines), header_from_text(text or "")
 
 
 # ------------------------------------------------------------ RFQ header
@@ -275,7 +442,7 @@ LABEL_SYNONYMS = {
 
 # The first line that looks like the document title ends the letterhead.
 TITLE_RE = re.compile(
-    r"request\s+for\s+(?:quotation|quote|price|proposal)|\brfq\b|\benquiry\b|\binquiry\b",
+    r"request\s*for\s*(?:quotation|quote|price|proposal)|\brfq\b|\benquiry\b|\binquiry\b",
     re.I,
 )
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -286,17 +453,22 @@ PHONE_RES = [
 CONTACT_LINE_RE = re.compile(
     r"@|https?://|\b(?:tel|telephone|phone|ph|mob|mobile|fax|email|e-mail|www)\b", re.I
 )
-CURRENCY_RE = re.compile(r"\b(GBP|USD|EUR|INR|AED|CAD|AUD)\b")
+# No \b on the left: OCR often glues words ("inGBP").
+CURRENCY_RE = re.compile(r"(?<![A-Z])(GBP|USD|EUR|INR|AED|CAD|AUD)\b")
 CURRENCY_SYMBOLS = {"£": "GBP", "€": "EUR", "₹": "INR"}
 
 
 def text_lines_from_pdf(path: Path):
     import pdfplumber
+    from src import layout, ocr
 
     lines = []
     with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            lines += (page.extract_text() or "").splitlines()
+        for number, page in enumerate(pdf.pages, start=1):
+            if ocr.page_needs_ocr(page):
+                lines += layout.text_lines(ocr.ocr_pdf_page(path, number - 1))
+            else:
+                lines += (page.extract_text() or "").splitlines()
     return lines
 
 
@@ -374,6 +546,8 @@ def tidy_date(text: str) -> str:
     """'15 October 2026' -> '15/10/2026'. Anything unclear is kept as written."""
     if not text:
         return ""
+    # OCR can glue words: '15 October2026' -> '15 October 2026'.
+    text = re.sub(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z]{3,})", " ", text)
     try:
         if re.match(r"^\d{4}-\d{2}-\d{2}", text):
             return pd.to_datetime(text[:10], format="%Y-%m-%d").strftime("%d/%m/%Y")
@@ -386,23 +560,28 @@ def extract_rfq_header(path) -> dict:
     """Return the RFQ's header details as a dict (empty string if not found)."""
     path = Path(path)
     suffix = path.suffix.lower()
+    if suffix in EMAIL_SUFFIXES:
+        return _header_from_email(path)
     if suffix not in READERS or suffix not in TEXT_READERS:
-        raise ValueError(f"Unsupported file type '{path.suffix}'. Use PDF, DOCX or XLSX.")
+        raise ValueError(f"Unsupported file type '{path.suffix}'. Use {SUPPORTED_TEXT}.")
 
     header = {key: "" for key, _ in HEADER_FIELDS}
     lines = TEXT_READERS[suffix](path)
     header.update(parse_letterhead(lines))
 
     # 'Label | value' rows anywhere in the file (RFQ No., Date, Project...).
-    for _, rows in READERS[suffix](path):
-        for row in rows:
-            cells = [clean(c) for c in row if clean(c)]
-            if len(cells) < 2:
-                continue
-            key = header_key(cells[0])
-            for field, names in LABEL_SYNONYMS.items():
-                if key in names and not header[field]:
-                    header[field] = cells[1]
+    if suffix == ".pdf":
+        label_rows = label_rows_from_pdf(path)
+    else:
+        label_rows = [r for _, rows in READERS[suffix](path) for r in rows]
+    for row in label_rows:
+        cells = [clean(c) for c in row if clean(c)]
+        if len(cells) < 2:
+            continue
+        key = header_key(cells[0])
+        for field, names in LABEL_SYNONYMS.items():
+            if key in names and not header[field]:
+                header[field] = cells[1]
 
     header["rfq_date"] = tidy_date(header["rfq_date"])
 
@@ -418,7 +597,35 @@ def extract_rfq_header(path) -> dict:
     return header
 
 
+def _header_from_email(path: Path) -> dict:
+    """Header from the email itself; gaps are filled from an attached RFQ."""
+    from tempfile import TemporaryDirectory
+
+    from src.read_email import header_from_mail, read_email
+
+    mail = read_email(path)
+    header = header_from_mail(mail)
+    with TemporaryDirectory() as folder:
+        for filename, data in mail["attachments"]:
+            if Path(filename).suffix.lower() not in READERS or not data:
+                continue
+            attached = Path(folder) / filename
+            attached.write_bytes(data)
+            try:
+                from_file = extract_rfq_header(attached)
+            except Exception:
+                continue
+            for key, value in from_file.items():
+                # The attached RFQ document is more formal than the email for
+                # these fields; for the rest the email wins.
+                if value and (not header[key] or key in ("customer_name", "address", "rfq_number")):
+                    header[key] = value
+    return header
+
+
 if __name__ == "__main__":
+    # Allow 'python src/extract_rfq.py file' as well as 'python -m src.extract_rfq'.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     if len(sys.argv) != 2:
         sys.exit("Usage: python src/extract_rfq.py <rfq file>")
     result = extract_rfq_lines(sys.argv[1])

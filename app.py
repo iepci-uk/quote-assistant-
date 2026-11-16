@@ -7,7 +7,13 @@ import base64
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from src.extract_rfq import HEADER_FIELDS, extract_rfq_header, extract_rfq_lines
+from src.extract_rfq import (
+    HEADER_FIELDS,
+    NoLineItemsError,
+    extract_rfq_from_text,
+    extract_rfq_header,
+    extract_rfq_lines,
+)
 from src.match_missing_codes import find_missing_code_candidates
 from src.load_price_lists import load_catalogue
 from src.generate_quotation import generate_quotation
@@ -104,35 +110,65 @@ def prepare_rfq(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def store_rfq(lines: pd.DataFrame, header: dict, filename: str) -> None:
+    """Put a freshly extracted RFQ into session state and reset old edits."""
+    st.session_state["rfq_lines"] = prepare_rfq(pd.DataFrame(lines))
+    st.session_state["rfq_filename"] = filename
+    st.session_state["rfq_db_id"] = None
+    st.session_state["match_candidates"] = None
+    st.session_state["rfq_header"] = header
+    for key, _ in HEADER_FIELDS:
+        st.session_state.pop(f"hdr_{key}", None)
+    st.session_state.pop("rfq_editor", None)
+    st.session_state.pop("pricing_editor", None)
+    st.session_state.pop("quotation_bytes", None)
+
+
 def load_rfq_bytes(file_bytes: bytes, filename: str) -> bool:
-    """Extract RFQ lines and header from file bytes into session state."""
+    """Extract RFQ lines and header from file bytes into session state.
+    Returns False when the file was read but holds no line items."""
     with TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir) / filename
         temp_path.write_bytes(file_bytes)
 
-        extracted = extract_rfq_lines(str(temp_path))
-        extracted = pd.DataFrame(extracted)
-
-        if extracted.empty:
+        try:
+            extracted = extract_rfq_lines(str(temp_path))
+        except NoLineItemsError:
             return False
-
-        st.session_state["rfq_lines"] = prepare_rfq(extracted)
-        st.session_state["rfq_filename"] = filename
-        st.session_state["rfq_db_id"] = None
-        st.session_state["match_candidates"] = None
 
         try:
             header = extract_rfq_header(str(temp_path))
         except Exception:
             header = {key: "" for key, _ in HEADER_FIELDS}
 
-        st.session_state["rfq_header"] = header
-        for key, _ in HEADER_FIELDS:
-            st.session_state.pop(f"hdr_{key}", None)
-        st.session_state.pop("rfq_editor", None)
-        st.session_state.pop("pricing_editor", None)
-        st.session_state.pop("quotation_bytes", None)
+        store_rfq(extracted, header, filename)
         return True
+
+
+def load_rfq_text(text: str) -> bool:
+    """Extract RFQ lines and header from pasted text (e.g. an email body)."""
+    try:
+        extracted, header = extract_rfq_from_text(text)
+    except NoLineItemsError:
+        return False
+    store_rfq(extracted, header, "Pasted email text")
+    return True
+
+
+def scanned_page_count(file_bytes: bytes, filename: str) -> int:
+    """How many pages of an uploaded PDF are scans that need OCR."""
+    if not filename.lower().endswith(".pdf"):
+        return 0
+    import io
+
+    import pdfplumber
+    from src.ocr import page_needs_ocr
+
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            return sum(page_needs_ocr(page) for page in pdf.pages)
+    except Exception:
+        return 0
 
 
 def load_rfq_from_database(rfq_id: int) -> bool:
@@ -648,7 +684,7 @@ elif current_page == "RFQ Analysis":
             <div class="section-eyebrow">STEP 1 · DOCUMENT INTAKE</div>
             <div class="section-heading">Upload & Review RFQ</div>
             <div class="section-description">
-                Extract tabular line items and header metadata from PDF, Excel, or Word documents.
+                Extract line items and header details from PDF (including scans), Excel, Word, emails or pasted text.
             </div>
         </div>
         """,
@@ -660,57 +696,92 @@ elif current_page == "RFQ Analysis":
         """
         <div class="ui-card">
             <div class="ui-card-title">Select RFQ Document</div>
-            <div class="ui-card-subtitle">Supported formats: PDF (.pdf), Excel (.xlsx, .xls), Word (.docx)</div>
+            <div class="ui-card-subtitle">Supported: PDF (incl. scanned), Excel (.xlsx), Word (.docx), emails (.eml, .msg), text (.txt) &mdash; or paste the email text</div>
         """,
         unsafe_allow_html=True,
     )
 
-    uploaded_file = st.file_uploader(
-        "Upload customer RFQ file",
-        type=["pdf", "xlsx", "xls", "docx"],
-        label_visibility="collapsed",
-    )
+    tab_file, tab_text = st.tabs([":material/upload_file: Upload file", ":material/mail: Paste email text"])
 
-    col_up1, col_up2 = st.columns([1, 1])
-    with col_up1:
-        if uploaded_file and st.button("Extract RFQ Items from Upload", type="primary", use_container_width=True):
-            try:
-                with st.status("Analyzing RFQ Document...", expanded=True) as status:
-                    st.write("Step 1/4: Reading RFQ Document...")
-                    import time
-                    time.sleep(0.3)
-                    success = load_rfq_bytes(uploaded_file.getvalue(), uploaded_file.name)
-                    if success:
+    with tab_file:
+        uploaded_file = st.file_uploader(
+            "Upload customer RFQ file",
+            type=["pdf", "xlsx", "docx", "eml", "msg", "txt"],
+            label_visibility="collapsed",
+        )
+
+        col_up1, col_up2 = st.columns([1, 1])
+        with col_up1:
+            if uploaded_file and st.button("Extract RFQ Items from Upload", type="primary", width="stretch"):
+                try:
+                    with st.status("Analyzing RFQ Document...", expanded=True) as status:
+                        file_bytes = uploaded_file.getvalue()
+                        scanned = scanned_page_count(file_bytes, uploaded_file.name)
+                        if scanned:
+                            st.write(
+                                f"Step 1/4: Reading {scanned} scanned page(s) with OCR "
+                                "(about 20-30 seconds a page)..."
+                            )
+                        else:
+                            st.write("Step 1/4: Reading RFQ Document...")
+                        success = load_rfq_bytes(file_bytes, uploaded_file.name)
+                        if success:
+                            line_count = len(st.session_state.get('rfq_lines', []))
+                            st.write(f"Step 2/4: Matching {line_count} lines against master catalogue...")
+                            st.write("Step 3/4: Pricing line items...")
+                            st.write("Step 4/4: Draft quotation ready.")
+                            status.update(label="RFQ Analysis Complete", state="complete", expanded=False)
+                            st.rerun()
+                        else:
+                            status.update(label="No line items found", state="error", expanded=True)
+                            st.warning(
+                                "No line items were found in the uploaded file. There was no item "
+                                "table, and no text lines with a quantity (e.g. '10 nos') or a "
+                                "numbered item list."
+                            )
+                except Exception as error:
+                    st.error(f"Extraction failed: {error}")
+
+        with col_up2:
+            sample_pdf = Path("data/raw/RFQ_KBS-0147.pdf")
+            if sample_pdf.exists():
+                if st.button("Or Load Test Sample RFQ (RFQ_KBS-0147.pdf)", width="stretch"):
+                    with st.status("Analyzing RFQ Document...", expanded=True) as status:
+                        st.write("Step 1/4: Reading RFQ Document...")
+                        load_rfq_bytes(sample_pdf.read_bytes(), sample_pdf.name)
                         line_count = len(st.session_state.get('rfq_lines', []))
                         st.write(f"Step 2/4: Matching {line_count} lines against master catalogue...")
-                        time.sleep(0.3)
                         st.write("Step 3/4: Pricing line items...")
-                        time.sleep(0.2)
                         st.write("Step 4/4: Draft quotation ready.")
                         status.update(label="RFQ Analysis Complete", state="complete", expanded=False)
-                        st.rerun()
-                    else:
-                        st.warning("No line items were found in the uploaded file.")
+                    st.rerun()
+
+    with tab_text:
+        pasted = st.text_area(
+            "Paste the RFQ email or item list",
+            height=220,
+            placeholder=(
+                "Dear Sir,\nPlease quote for:\n"
+                "1. ABB MCB 3 pole 32A 1SYS273022R0324 - 24 nos\n"
+                "2. Schneider MCCB LV510347 100A 4P - 4 nos\n\nRegards,\n..."
+            ),
+            help=(
+                "One item per line with a quantity ('10 nos', '5 x ...', 'Qty: 8'), "
+                "labelled blocks (Description: / Make: / Part No: / Qty:), or a table "
+                "copied from Excel all work. The signature and quoted replies are ignored."
+            ),
+        )
+        if st.button("Extract items from text", type="primary", disabled=not pasted.strip(), key="extract_text"):
+            try:
+                if load_rfq_text(pasted):
+                    st.rerun()
+                else:
+                    st.warning(
+                        "No line items were found in the text. Put one item per line with its "
+                        "quantity (e.g. 'ABB MCB 32A 4P - 10 nos'), or paste the item table."
+                    )
             except Exception as error:
                 st.error(f"Extraction failed: {error}")
-
-    with col_up2:
-        sample_pdf = Path("data/raw/RFQ_KBS-0147.pdf")
-        if sample_pdf.exists():
-            if st.button("Or Load Test Sample RFQ (RFQ_KBS-0147.pdf)", use_container_width=True):
-                with st.status("Analyzing RFQ Document...", expanded=True) as status:
-                    st.write("Step 1/4: Reading RFQ Document...")
-                    import time
-                    time.sleep(0.3)
-                    load_rfq_bytes(sample_pdf.read_bytes(), sample_pdf.name)
-                    line_count = len(st.session_state.get('rfq_lines', []))
-                    st.write(f"Step 2/4: Matching {line_count} lines against master catalogue...")
-                    time.sleep(0.3)
-                    st.write("Step 3/4: Pricing line items...")
-                    time.sleep(0.2)
-                    st.write("Step 4/4: Draft quotation ready.")
-                    status.update(label="RFQ Analysis Complete", state="complete", expanded=False)
-                st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -729,6 +800,22 @@ elif current_page == "RFQ Analysis":
             """,
             unsafe_allow_html=True,
         )
+
+        sources = rfq["source"].astype(str) if "source" in rfq.columns else pd.Series(dtype=str)
+        from_ocr = int(sources.str.contains("OCR").sum())
+        from_text = int(sources.str.contains(r"text|email body", regex=True).sum())
+        flagged = sorted({s.split("check line", 1)[1].strip() for s in sources if "check line" in s})
+        if from_ocr:
+            note = f"{from_ocr} line(s) were read from a scanned page with OCR. Check codes and quantities against the scan."
+            if flagged:
+                note += f" Some text was hard to read - look closely at line(s) {', '.join(flagged)}."
+            st.info(note, icon=":material/document_scanner:")
+        if from_text:
+            st.info(
+                f"{from_text} line(s) were read from free text (email or document without a table). "
+                "Check that every item was picked up and the descriptions are complete.",
+                icon=":material/mail:",
+            )
 
         edited = st.data_editor(
             rfq,
