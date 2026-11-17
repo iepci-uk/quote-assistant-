@@ -100,18 +100,6 @@ def main() -> None:
     lines = extract_rfq_lines(sys.argv[1])
     report = check_lines(lines, load_catalogue())
 
-    pd.set_option("display.width", 200, "display.max_colwidth", 60)
-    print(report.to_string(index=False))
-    print(f"\n{report['line'].nunique()} RFQ lines checked.")
-    print(f"{len(report)} report rows, including duplicate matches.")
-
-    review_lines = report.loc[
-        report["result"].str.startswith("HUMAN REVIEW NEEDED"),
-        "line",
-    ].nunique()
-
-    print(f"{review_lines} RFQ lines need human review.")
-
 
 if __name__ == "__main__":
     main()

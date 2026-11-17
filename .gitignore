@@ -31,3 +31,8 @@ Thumbs.db
 
 # Generated outputs and processed data
 data/processed/
+
+# SQLite local databases
+*.db
+*.sqlite3
+data/*.db

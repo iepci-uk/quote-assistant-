@@ -416,10 +416,3 @@ if __name__ == "__main__":
     if args.date:
         header["quote_date"] = args.date
     path = generate_quotation(output_path=args.out, rfq_df=lines, header=header)
-    print(f"Draft quotation created: {path}")
-    if args.list_prices:
-        priced = int(lines["price_approved"].astype(bool).sum())
-        print(f"{priced} of {len(lines)} lines priced at supplier list price (INR, no discount).")
-        print("Lines without a clear price are blank and marked REVIEW.")
-    else:
-        print("Unit rates and final totals have not been approved.")

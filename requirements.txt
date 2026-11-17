@@ -4,3 +4,6 @@ pdfplumber # For reading PDFs
 python-docx # For reading Word files
 streamlit # For the web app
 pytest # For testing
+sqlalchemy # For database connectivity
+rapidocr_onnxruntime # Local OCR for scanned PDFs (models included, no internet or API key)
+extract-msg # For reading Outlook .msg emails
